@@ -8,6 +8,7 @@
 
 #include "hardware/gpio.h"
 #include "hardware/i2c.h"
+#include "hardware/uart.h"
 #include "mpu6050.h"
 
 #include "Fusion.h"
@@ -16,6 +17,12 @@
 const int MPU_ADDRESS = 0x68;
 const int I2C_SDA_GPIO = 4;
 const int I2C_SCL_GPIO = 5;
+
+// UART configuration
+#define UART_ID         uart0
+#define UART_TX_PIN     0  // GP0 TX
+#define UART_RX_PIN     1  // GP1 RX (se precisar)
+#define UART_BAUDRATE   115200
 
 static void mpu6050_reset() {
     // Two byte reset. First byte register, second byte data
@@ -60,7 +67,6 @@ static void mpu6050_read_raw(int16_t accel[3], int16_t gyro[3], int16_t *temp) {
 }
 
 void mpu6050_task(void *p) {
-    // configuracao do I2C
     i2c_init(i2c_default, 400 * 1000);
     gpio_set_function(I2C_SDA_GPIO, GPIO_FUNC_I2C);
     gpio_set_function(I2C_SCL_GPIO, GPIO_FUNC_I2C);
@@ -68,24 +74,51 @@ void mpu6050_task(void *p) {
     gpio_pull_up(I2C_SCL_GPIO);
 
     mpu6050_reset();
-    int16_t acceleration[3], gyro[3], temp;
-
-    while(1) {
-        // leitura da MPU, sem fusao de dados
-        mpu6050_read_raw(acceleration, gyro, &temp);
-        printf("Acc. X = %d, Y = %d, Z = %d\n", acceleration[0], acceleration[1], acceleration[2]);
-        printf("Gyro. X = %d, Y = %d, Z = %d\n", gyro[0], gyro[1], gyro[2]);
-        printf("Temp. = %f\n", (temp / 340.0) + 36.53);
-
+    
+    int16_t rawAccel[3], rawGyro[3], rawTemp;
+    
+    FusionAhrs ahrs;
+    FusionAhrsInitialise(&ahrs);
+    
+    char buf[64];
+    
+    while (1) {
+        mpu6050_read_raw(rawAccel, rawGyro, &rawTemp);
+        
+        FusionVector gyroscope = {
+            .axis.x = rawGyro[0] / 131.0f,
+            .axis.y = rawGyro[1] / 131.0f,
+            .axis.z = rawGyro[2] / 131.0f,
+        };
+        FusionVector accelerometer = {
+            .axis.x = rawAccel[0] / 16384.0f,
+            .axis.y = rawAccel[1] / 16384.0f,
+            .axis.z = rawAccel[2] / 16384.0f,
+        };
+        
+        FusionAhrsUpdateNoMagnetometer(&ahrs, gyroscope, accelerometer, SAMPLE_PERIOD);
+        FusionEuler euler = FusionQuaternionToEuler(FusionAhrsGetQuaternion(&ahrs));
+        
+        int click = (accelerometer.axis.z > 0.5f) ? 1 : 0;
+        int tamanho = snprintf(buf, sizeof(buf), "%.2f,%.2f,%.2f,%d\n",
+                        euler.angle.roll,
+                        euler.angle.pitch,
+                        euler.angle.yaw,
+                        click);
+        
+        uart_write_blocking(UART_ID, (uint8_t *)buf, tamanho);
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
 int main() {
     stdio_init_all();
-
-    xTaskCreate(mpu6050_task, "mpu6050_Task 1", 8192, NULL, 1, NULL);
-
+    
+    uart_init(UART_ID, UART_BAUDRATE);
+    gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
+    gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
+    
+    xTaskCreate(mpu6050_task, "mpu6050", 4096, NULL, 1, NULL);
     vTaskStartScheduler();
 
     while (true)
